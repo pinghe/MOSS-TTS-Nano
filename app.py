@@ -1535,6 +1535,9 @@ def _render_index_html(
     }
 
     function updateBufferedPlaybackHighlight() {
+      if (hasRealtimePlayback()) {
+        return;
+      }
       if (!hasBufferedPlayback() || !playbackChunks.length || currentPlaybackMarkedComplete) {
         return;
       }
@@ -1937,11 +1940,8 @@ def _render_index_html(
       }
       resolvedPrompt.textContent = "Generated speech is ready.";
       streamMetrics.textContent = result.stream_metrics || streamMetrics.textContent;
-      if (Array.isArray(result.text_chunks) && result.text_chunks.length > 0) {
+      if (Array.isArray(result.text_chunks) && result.text_chunks.length > 0 && playbackChunks.length === 0) {
         renderPlaybackScript(result.text_chunks, normalizedTextOutput.value || textInput.value);
-      }
-      if (playbackChunks.length > 0) {
-        setPlaybackHighlight(playbackChunks.length - 1);
       }
       setStatus(runStatus, result.run_status || "Stream complete.");
       if (currentStreamId) {
