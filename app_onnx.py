@@ -596,7 +596,32 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _patch_torchaudio_backend() -> None:
+    """Patch torchaudio to avoid the SoX backend, which segfaults on some systems."""
+    try:
+        import torchaudio
+        _original_load = torchaudio.load
+        _original_save = torchaudio.save
+
+        def _load_with_soundfile(uri, *args, backend=None, **kwargs):
+            if backend is None:
+                backend = "soundfile"
+            return _original_load(uri, *args, backend=backend, **kwargs)
+
+        def _save_with_soundfile(uri, src, sample_rate, *args, backend=None, **kwargs):
+            if backend is None:
+                backend = "soundfile"
+            return _original_save(uri, src, sample_rate, *args, backend=backend, **kwargs)
+
+        torchaudio.load = _load_with_soundfile
+        torchaudio.save = _save_with_soundfile
+    except ImportError:
+        pass
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    _patch_torchaudio_backend()
+
     args = parse_args(argv)
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

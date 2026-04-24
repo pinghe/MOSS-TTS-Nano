@@ -22,12 +22,22 @@ import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 
 from moss_tts_nano_runtime import (
     DEFAULT_AUDIO_TOKENIZER_PATH,
     DEFAULT_CHECKPOINT_PATH,
     DEFAULT_OUTPUT_DIR,
     NanoTTSService,
+    resolve_device,
+)
+from openai_audio_api import (
+    FORMAT_CONTENT_TYPE,
+    SpeechRequest,
+    iter_pcm_audio,
+    make_error_response,
+    resolve_voice,
+    _wav_header_bytes,
 )
 from text_normalization_pipeline import (
     TextNormalizationSnapshot as SharedTextNormalizationSnapshot,
@@ -2175,6 +2185,7 @@ def _build_app(
     warmup_manager: WarmupManager,
     text_normalizer_manager: WeTextProcessingManager | None,
     root_path: str | None,
+    runtime_device: str = "cpu",
 ) -> FastAPI:
     app = FastAPI(title="MOSS-TTS-Nano Demo", root_path=root_path or "")
     stream_jobs = StreamingJobManager()
@@ -2833,10 +2844,228 @@ def _build_app(
             _maybe_delete_file(generated_audio_path)
             _maybe_delete_file(prompt_audio_cleanup_path)
 
+    # ------------------------------------------------------------------
+    # OpenAI-compatible endpoint: POST /v1/audio/speech
+    # ------------------------------------------------------------------
+
+    @app.post("/v1/audio/speech")
+    async def openai_audio_speech(request: Request):
+        import pydantic
+
+        # 1. Parse & validate request body
+        try:
+            body = await request.json()
+            speech_req = SpeechRequest(**body)
+        except pydantic.ValidationError as exc:
+            # Return the first validation error as OpenAI-format JSON
+            first_err = exc.errors()[0]
+            param = first_err.get("loc", [None])[-1]
+            return JSONResponse(
+                status_code=400,
+                content=make_error_response(
+                    message=first_err.get("msg", "Invalid request"),
+                    param=str(param) if param else None,
+                )[0],
+            )
+        except Exception as exc:
+            return JSONResponse(
+                status_code=400,
+                content=make_error_response(
+                    message=f"Invalid JSON body: {exc}",
+                )[0],
+            )
+
+        request_start = time.monotonic()
+
+        logging.info(
+            "OpenAI /v1/audio/speech request: model=%s input=%r voice=%s response_format=%s speed=%s",
+            speech_req.model,
+            speech_req.input[:80] + ("..." if len(speech_req.input) > 80 else ""),
+            speech_req.voice,
+            speech_req.response_format,
+            speech_req.speed,
+        )
+
+        # 2. Validate input length
+        if len(speech_req.input) > 4096:
+            err_body, status = make_error_response(
+                message="input text exceeds maximum length of 4096 characters.",
+                param="input",
+            )
+            return JSONResponse(status_code=status, content=err_body)
+
+        # 3. Resolve voice name (OpenAI name → MOSS preset, or passthrough)
+        moss_voice = resolve_voice(speech_req.voice)
+
+        # 4. Prepare text
+        try:
+            prepared_texts = shared_prepare_tts_request_texts(
+                text=speech_req.input,
+                enable_wetext=True,
+                enable_normalize_tts_text=True,
+                text_normalizer_manager=text_normalizer_manager,
+            )
+        except Exception:
+            logging.exception("Text normalization failed for OpenAI endpoint")
+            return JSONResponse(
+                status_code=500,
+                content=make_error_response(
+                    message="Text normalization failed.",
+                    error_type="server_error",
+                    status_code=500,
+                )[0],
+            )
+
+        # 5. Ensure warmup
+        warmup_snapshot = warmup_manager.snapshot()
+        if not warmup_snapshot.ready:
+            warmup_snapshot = warmup_manager.ensure_ready()
+            if not warmup_snapshot.ready:
+                return JSONResponse(
+                    status_code=503,
+                    content=make_error_response(
+                        message="Model is still warming up. Please retry later.",
+                        error_type="server_error",
+                        status_code=503,
+                    )[0],
+                )
+
+        # 6. Build streaming response via background thread + queue
+        #    This avoids holding _cpu_execution_lock inside the ASGI
+        #    streaming iterator (which can deadlock on client disconnect).
+        response_format = speech_req.response_format
+
+        audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
+        client_disconnected = threading.Event()
+
+        def _put(chunk: bytes) -> bool:
+            """Put a chunk into the queue, returning False on timeout/disconnect."""
+            deadline = time.monotonic() + 30  # bail after 30s of queue full
+            while not client_disconnected.is_set() and time.monotonic() < deadline:
+                try:
+                    audio_queue.put(chunk, timeout=0.5)
+                    return True
+                except queue.Full:
+                    continue
+            client_disconnected.set()
+            return False
+
+        def _run_tts():
+            events_gen = None
+            try:
+                events_gen = runtime_manager.iter_with_runtime(
+                    requested_execution_device=runtime_device,
+                    cpu_threads=0,
+                    factory=lambda rt: rt.synthesize_stream(
+                        text=str(prepared_texts["text"]),
+                        mode="voice_clone",
+                        voice=moss_voice,
+                        prompt_audio_path=None,
+                    ),
+                )
+                audio_chunks = 0
+                if response_format == "wav":
+                    header_sent = False
+                    for pcm, sample_rate, channels in iter_pcm_audio(events_gen):
+                        if client_disconnected.is_set():
+                            return
+                        audio_chunks += 1
+                        if not header_sent:
+                            if not _put(_wav_header_bytes(sample_rate, channels)):
+                                return
+                            header_sent = True
+                        if not _put(pcm):
+                            return
+                elif response_format == "mp3":
+                    encoder = None
+                    for pcm, sample_rate, channels in iter_pcm_audio(events_gen):
+                        if client_disconnected.is_set():
+                            return
+                        audio_chunks += 1
+                        if encoder is None:
+                            import lameenc
+                            encoder = lameenc.Encoder()
+                            encoder.set_bit_rate(128)
+                            encoder.set_in_sample_rate(sample_rate)
+                            encoder.set_channels(channels)
+                            encoder.set_quality(2)
+                        if not _put(bytes(encoder.encode(pcm))):
+                            return
+                    if encoder is not None:
+                        flush = encoder.flush()
+                        if flush:
+                            _put(bytes(flush))
+                else:  # pcm
+                    for pcm, _, _ in iter_pcm_audio(events_gen):
+                        if client_disconnected.is_set():
+                            return
+                        audio_chunks += 1
+                        if not _put(pcm):
+                            return
+            except Exception:
+                logging.exception("TTS thread failed for OpenAI /v1/audio/speech")
+            finally:
+                elapsed = time.monotonic() - request_start
+                logging.info(
+                    "OpenAI /v1/audio/speech complete: format=%s audio_chunks=%d elapsed=%.2fs",
+                    response_format, audio_chunks, elapsed,
+                )
+                # Explicitly close the events generator to release
+                # _cpu_execution_lock held by iter_with_runtime.
+                if events_gen is not None:
+                    events_gen.close()
+                # Always push sentinel, even on error/disconnect
+                try:
+                    audio_queue.put(None, timeout=1.0)
+                except queue.Full:
+                    pass
+
+        tts_thread = threading.Thread(target=_run_tts, daemon=True)
+        tts_thread.start()
+
+        def _audio_from_queue():
+            while True:
+                chunk = audio_queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+
+        content_type = FORMAT_CONTENT_TYPE.get(response_format, "application/octet-stream")
+
+        return StreamingResponse(
+            iterate_in_threadpool(_audio_from_queue()),
+            media_type=content_type,
+        )
+
     return app
 
 
+def _patch_torchaudio_backend() -> None:
+    """Patch torchaudio to avoid the SoX backend, which segfaults on some systems."""
+    try:
+        import torchaudio
+        _original_load = torchaudio.load
+        _original_save = torchaudio.save
+
+        def _load_with_soundfile(uri, *args, backend=None, **kwargs):
+            if backend is None:
+                backend = "soundfile"
+            return _original_load(uri, *args, backend=backend, **kwargs)
+
+        def _save_with_soundfile(uri, src, sample_rate, *args, backend=None, **kwargs):
+            if backend is None:
+                backend = "soundfile"
+            return _original_save(uri, src, sample_rate, *args, backend=backend, **kwargs)
+
+        torchaudio.load = _load_with_soundfile
+        torchaudio.save = _save_with_soundfile
+    except ImportError:
+        pass
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    _patch_torchaudio_backend()
+
     parser = argparse.ArgumentParser(description="MOSS-TTS-Nano web demo")
     parser.add_argument("--checkpoint-path", "--checkpoint_path", dest="checkpoint_path", type=str, default=str(DEFAULT_CHECKPOINT_PATH))
     parser.add_argument(
@@ -2847,7 +3076,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         default=str(DEFAULT_AUDIO_TOKENIZER_PATH),
     )
     parser.add_argument("--output-dir", "--output_dir", dest="output_dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "auto"])
+    parser.add_argument("--device", type=str, default="auto", choices=["cpu", "auto", "cuda"])
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument(
         "--attn-implementation",
@@ -2867,9 +3096,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         level=logging.INFO,
     )
 
-    resolved_runtime_device = "cpu"
-    if args.device != "cpu":
-        logging.info("CPU-only app mode: ignoring --device=%s and forcing cpu.", args.device)
+    resolved_runtime_device = str(resolve_device(args.device))
+    logging.info("resolved device=%s", resolved_runtime_device)
 
     runtime = NanoTTSService(
         checkpoint_path=args.checkpoint_path,
@@ -2890,13 +3118,46 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.share:
         logging.warning("--share is ignored by the FastAPI-based Nano-TTS app.")
 
-    app = _build_app(runtime, warmup_manager, text_normalizer_manager, root_path)
+    app = _build_app(runtime, warmup_manager, text_normalizer_manager, root_path, resolved_runtime_device)
     uvicorn.run(
         app,
         host=args.host,
         port=args.port,
         log_level="info",
         root_path=root_path or "",
+        log_config={
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "default": {
+                    "()": "uvicorn.logging.DefaultFormatter",
+                    "fmt": "%(asctime)s %(levelprefix)s %(message)s",
+                    "datefmt": "%Y-%m-%d %H:%M:%S",
+                },
+                "access": {
+                    "()": "uvicorn.logging.AccessFormatter",
+                    "fmt": "%(asctime)s %(levelprefix)s %(client_addr)s - \"%(request_line)s\" %(status_code)s",
+                    "datefmt": "%Y-%m-%d %H:%M:%S",
+                },
+            },
+            "handlers": {
+                "default": {
+                    "formatter": "default",
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stderr",
+                },
+                "access": {
+                    "formatter": "access",
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                },
+            },
+            "loggers": {
+                "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+                "uvicorn.error": {"level": "INFO"},
+                "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+            },
+        },
     )
 
 
